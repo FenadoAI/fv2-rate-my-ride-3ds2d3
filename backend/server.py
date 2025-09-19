@@ -43,6 +43,37 @@ class StatusCheck(BaseModel):
 class StatusCheckCreate(BaseModel):
     client_name: str
 
+# Car models
+class Car(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    photo: str  # Base64 encoded image
+    hot_votes: int = Field(default=0)
+    not_votes: int = Field(default=0)
+    total_votes: int = Field(default=0)
+    score: float = Field(default=0.0)  # hot_votes / total_votes
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class CarUpload(BaseModel):
+    photo: str  # Base64 encoded image
+
+class Vote(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    car_id: str
+    is_hot: bool  # True for "Hot", False for "Not"
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class VoteRequest(BaseModel):
+    car_id: str
+    is_hot: bool
+
+class CarResponse(BaseModel):
+    id: str
+    photo: str
+    hot_votes: int
+    not_votes: int
+    total_votes: int
+    score: float
+
 
 # AI agent models
 class ChatRequest(BaseModel):
@@ -89,6 +120,67 @@ async def create_status_check(input: StatusCheckCreate):
 async def get_status_checks():
     status_checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**status_check) for status_check in status_checks]
+
+# Car endpoints
+@api_router.post("/cars/upload", response_model=CarResponse)
+async def upload_car(car_upload: CarUpload):
+    """Upload a new car photo"""
+    car_data = Car(photo=car_upload.photo)
+    car_dict = car_data.dict()
+    await db.cars.insert_one(car_dict)
+
+    return CarResponse(**car_dict)
+
+@api_router.get("/cars/random", response_model=CarResponse)
+async def get_random_car():
+    """Get a random car for voting"""
+    pipeline = [{"$sample": {"size": 1}}]
+    cars = await db.cars.aggregate(pipeline).to_list(1)
+
+    if not cars:
+        raise HTTPException(status_code=404, detail="No cars available")
+
+    return CarResponse(**cars[0])
+
+@api_router.post("/cars/vote")
+async def vote_on_car(vote_request: VoteRequest):
+    """Vote on a car (Hot or Not)"""
+    # Record the vote
+    vote_data = Vote(car_id=vote_request.car_id, is_hot=vote_request.is_hot)
+    await db.votes.insert_one(vote_data.dict())
+
+    # Update car statistics
+    car = await db.cars.find_one({"id": vote_request.car_id})
+    if not car:
+        raise HTTPException(status_code=404, detail="Car not found")
+
+    # Update vote counts
+    if vote_request.is_hot:
+        car["hot_votes"] += 1
+    else:
+        car["not_votes"] += 1
+
+    car["total_votes"] = car["hot_votes"] + car["not_votes"]
+    car["score"] = car["hot_votes"] / car["total_votes"] if car["total_votes"] > 0 else 0.0
+
+    # Update in database
+    await db.cars.update_one(
+        {"id": vote_request.car_id},
+        {"$set": {
+            "hot_votes": car["hot_votes"],
+            "not_votes": car["not_votes"],
+            "total_votes": car["total_votes"],
+            "score": car["score"]
+        }}
+    )
+
+    return {"success": True, "message": "Vote recorded"}
+
+@api_router.get("/cars/leaderboard", response_model=List[CarResponse])
+async def get_leaderboard(limit: int = 10):
+    """Get top cars leaderboard"""
+    cars = await db.cars.find().sort("score", -1).limit(limit).to_list(limit)
+    return [CarResponse(**car) for car in cars]
 
 
 # AI agent routes
